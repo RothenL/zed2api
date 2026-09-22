@@ -80,6 +80,9 @@ pub const AccountManager = struct {
 };
 
 pub fn addAccount(allocator: std.mem.Allocator, name: []const u8, user_id: []const u8, access_token_json: []const u8) !void {
+    // Kept for compatibility with the desktop auth tool and any callers that build
+    // accounts.json incrementally. The Web UI's upload path replaces the whole file
+    // via server.zig::handleUploadAccounts instead.
     // Read existing
     var buf: [4 * 1024 * 1024]u8 = undefined;
     var existing_content: ?[]const u8 = null;

@@ -39,6 +39,58 @@ export async function switchAccount(name: string): Promise<void> {
   })
 }
 
+export async function deleteAccount(name: string): Promise<void> {
+  const r = await fetch('/zed/accounts/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ account: name }),
+  })
+  if (!r.ok) throw new Error(`${r.status}`)
+}
+
+export interface UploadResult {
+  success: boolean
+  count: number
+  accounts: string[]
+}
+
+/**
+ * Upload an accounts.json document. Accepts either:
+ *   - a File (read as text and wrapped), or
+ *   - a raw JSON string containing the accounts object.
+ * The server stores it verbatim and reloads the account manager.
+ */
+export async function uploadAccounts(input: File | string): Promise<UploadResult> {
+  let accountsJson: string
+  if (typeof input === 'string') {
+    accountsJson = input
+  } else {
+    accountsJson = await input.text()
+  }
+  // Validate client-side first so we can show a friendly error before uploading.
+  try {
+    const parsed = JSON.parse(accountsJson)
+    if (!parsed || typeof parsed !== 'object' || !('accounts' in parsed)) {
+      throw new Error('missing "accounts" field')
+    }
+    if (!parsed.accounts || typeof parsed.accounts !== 'object' || Object.keys(parsed.accounts).length === 0) {
+      throw new Error('"accounts" is empty')
+    }
+  } catch (e) {
+    throw new Error(`Invalid accounts.json: ${e instanceof Error ? e.message : String(e)}`)
+  }
+  const r = await fetch('/zed/accounts/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accounts_json: accountsJson }),
+  })
+  const data = await r.json()
+  if (!r.ok) {
+    throw new Error(data?.error || `upload failed (${r.status})`)
+  }
+  return data as UploadResult
+}
+
 export async function fetchUsage(): Promise<UsageInfo> {
   const r = await fetch('/zed/usage')
   if (!r.ok) throw new Error(`${r.status}`)
@@ -48,20 +100,6 @@ export async function fetchUsage(): Promise<UsageInfo> {
 export async function fetchBilling(): Promise<Record<string, unknown>> {
   const r = await fetch('/zed/billing')
   if (!r.ok) throw new Error(`${r.status}`)
-  return r.json()
-}
-
-export async function startLogin(name?: string): Promise<{ login_url?: string; error?: string }> {
-  const r = await fetch('/zed/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(name ? { name } : {}),
-  })
-  return r.json()
-}
-
-export async function fetchLoginStatus(): Promise<{ status: string }> {
-  const r = await fetch('/zed/login/status')
   return r.json()
 }
 

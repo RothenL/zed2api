@@ -217,17 +217,61 @@ body {
   margin-left: auto; font-size: 11px; color: var(--text-muted); opacity: 0.7;
 }
 
-.login-banner {
-  margin-top: 12px; padding: 12px 16px;
-  background: var(--accent-bg); border: 1px solid var(--accent);
-  border-radius: var(--radius-sm); font-size: 13px; color: var(--text);
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+/* Upload zone */
+.upload-zone {
+  margin-top: 16px;
+  background: var(--bg-card);
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 28px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: all var(--transition);
+  box-shadow: var(--shadow-sm);
 }
 
-.login-banner a { color: var(--accent); font-weight: 500; text-decoration: none; }
-.login-banner a:hover { text-decoration: underline; }
+.upload-zone:hover { border-color: var(--accent); background: var(--accent-bg); }
+.upload-zone.dragover { border-color: var(--accent); background: var(--accent-bg); transform: scale(1.01); }
 
-.login-hint { font-size: 11px; color: var(--text-muted); flex-basis: 100%; margin-top: 4px; }
+.upload-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 48px; height: 48px; border-radius: 50%;
+  background: var(--bg-input); color: var(--text-secondary);
+  margin: 0 auto 10px; transition: all var(--transition);
+}
+.upload-zone:hover .upload-icon, .upload-zone.dragover .upload-icon {
+  background: var(--accent); color: #fff;
+}
+
+.upload-title { font-size: 14px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.upload-desc { font-size: 12px; color: var(--text-muted); line-height: 1.6; max-width: 420px; margin: 0 auto 14px; }
+.upload-desc code { background: var(--bg-code); padding: 1px 5px; border-radius: 3px; font-family: var(--font-mono); font-size: 11px; }
+
+.upload-actions {
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  flex-wrap: wrap;
+}
+.upload-hint { font-size: 11px; color: var(--text-muted); }
+.upload-hint.error { color: var(--red); font-weight: 500; }
+
+.upload-help {
+  margin-top: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 18px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-sm);
+}
+.upload-help-title { display: flex; align-items: center; gap: 6px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.upload-help-title svg { width: 14px; height: 14px; color: var(--accent); }
+.upload-help ol { margin-left: 18px; line-height: 1.8; }
+.upload-help code { background: var(--bg-code); padding: 1px 5px; border-radius: 3px; font-family: var(--font-mono); font-size: 11px; }
+
+.account-actions { gap: 6px; }
+.delete-btn { color: var(--text-muted); }
+.delete-btn:hover { color: var(--red); border-color: var(--red); background: var(--red-bg); }
 
 /* Usage */
 .usage-section { margin-top: 20px; }

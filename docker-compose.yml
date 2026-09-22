@@ -1,0 +1,28 @@
+services:
+  zed2api:
+    build: .
+    # image: ghcr.io/<owner>/zed2api:latest
+    container_name: zed2api
+    restart: unless-stopped
+    ports:
+      - "${ZED2API_PORT:-8000}:8000"
+    environment:
+      # The server must bind to 0.0.0.0 inside the container — Docker delivers
+      # traffic on a non-loopback interface. External exposure is governed by the
+      # host-side port mapping above.
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      # Optional upstream proxy (Clash / v2ray / etc.) reachable from the container.
+      # If your proxy runs on the Docker host, use host.docker.internal (Docker
+      # Desktop) or the host's LAN IP (Linux). Left commented out by default.
+      # HTTPS_PROXY: "http://host.docker.internal:7890"
+    volumes:
+      # Persist accounts.json and any runtime temp files outside the container.
+      # Drop accounts.json in ./data/, or upload it through the Web UI.
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/v1/models"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

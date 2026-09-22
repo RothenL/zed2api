@@ -4,8 +4,9 @@ const ENDPOINTS = [
   { method: 'GET', path: '/v1/models', desc: 'List available models' },
   { method: 'GET', path: '/zed/accounts', desc: 'List configured accounts' },
   { method: 'POST', path: '/zed/accounts/switch', desc: 'Switch active account' },
+  { method: 'POST', path: '/zed/accounts/upload', desc: 'Upload accounts.json (auth file)' },
+  { method: 'POST', path: '/zed/accounts/delete', desc: 'Remove an account' },
   { method: 'GET', path: '/zed/usage', desc: 'Current account usage and plan info' },
-  { method: 'POST', path: '/zed/login', desc: 'Start GitHub OAuth login flow' },
   { method: 'POST', path: '/api/event_logging/batch', desc: 'Claude Code event logging (stub)' },
 ]
 
