@@ -1,16 +1,15 @@
 import './style.css'
 import { icons } from './icons'
 import { renderAccounts } from './pages/accounts'
-import { renderHealth } from './pages/health'
+import { fetchWithTimeout, renderHealth } from './pages/health'
 import { renderEndpoints } from './pages/endpoints'
 import { renderIntegration } from './pages/integration'
 import { authHeaders, loginWithToken } from './auth'
 
 const app = document.getElementById('app')!
 
-// Auth gate: the server may be running with AUTH_TOKEN set. Probe an
-// authenticated endpoint — a 401 means the server is gated and we lack a valid
-// token, so show the login card instead of the app shell.
+// Auth gate: probe the account API, which does not depend on Zed's model
+// service. A 401 means the shared token is missing or invalid.
 async function bootstrap() {
   if (!(await isAuthed())) {
     renderLoginCard()
@@ -22,10 +21,9 @@ async function bootstrap() {
 /** Whether this client can reach the gated API right now. */
 async function isAuthed(): Promise<boolean> {
   try {
-    const r = await fetch('/v1/models', { headers: authHeaders() })
-    // 401 => gated and not authed. Anything else (200, or a network failure we
-    // catch below) => render the app so the Health page can surface details.
-    return r.status !== 401
+    const { response } = await fetchWithTimeout('/zed/accounts', { headers: authHeaders() })
+    // Network failures and timeouts render the app so Health can show details.
+    return response.status !== 401
   } catch {
     return true
   }

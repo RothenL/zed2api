@@ -28,7 +28,7 @@
 - Anthropic 原生接口：`POST /v1/messages`
 - 模型列表：`GET /v1/models`
 - 多账号管理 + 自动故障转移
-- SSE 流式输出
+- SSE 流式输出：`/v1/chat/completions` 返回 OpenAI `chat.completion.chunk` 和 `[DONE]`；`/v1/messages` 返回 Anthropic `message_*` / `content_block_*` 事件。客户端需选择与 URL 匹配的 API 类型。
 - 多模型供应商：Anthropic / OpenAI / Google / xAI
 - 扩展思考 (thinking) 支持
 - 内嵌 Web UI 管理界面
@@ -229,7 +229,9 @@ docker compose ps
 - 容器内服务绑定 `0.0.0.0:8000`，由 Docker 端口映射控制对外暴露。
 - 运行时数据（`accounts.json` 等）持久化在 `./data` 卷，首次启动后通过 Web UI 上传账号文件。
 - 容器以非 root 用户 `zed2api`（uid 10001）运行：entrypoint 先以 root 修正 `/data` 属主，再用 `gosu` 降权 —— 所以即使宿主机以 root 建了 `./data`，上传也不会再报 `cannot write accounts.json`。
-- 健康检查打 `/healthz`（永远公开），与鉴权和账号解耦：开启 `AUTH_TOKEN` 后容器仍能正常判为 healthy。
+- 健康检查打 `/healthz`（永远公开），与鉴权和账号解耦：开启 `AUTH_TOKEN` 后容器仍能正常判为 healthy。**这只是进程存活探针**，不能证明 Zed 上游、账号或模型请求正常。Web UI 的 Health Check 会分别检查这些路径，模型列表可能回退至缓存或内嵌列表，响应头 `X-Models-Source` 标明 `upstream` / `cache` / `stale` / `static`。
+
+若 Health Check 的模型或 Token 检查失败，请先检查 `docker compose logs --tail=100 zed2api`，再检查容器是否能访问 `cloud.zed.dev`；宿主机代理并不会自动成为容器代理，必要时给 Compose 配置容器可访问的 `HTTPS_PROXY`。不要在日志、截图或工单里粘贴授权文件、JWT、共享 token。
 
 ### 构建阶段说明（`Dockerfile`）
 

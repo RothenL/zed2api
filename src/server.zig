@@ -13,6 +13,7 @@ var global_allocator: std.mem.Allocator = undefined;
 // Dynamic models cache
 var cached_models_openai: ?[]const u8 = null;
 var cached_models_time: i64 = 0;
+var models_mutex: std.Thread.Mutex = .{};
 const MODELS_CACHE_TTL: i64 = 3600; // 1 hour
 
 // Shared bearer token gating every API + management route. null = auth disabled
@@ -199,9 +200,7 @@ fn handleConnection(conn_stream: std.net.Stream) void {
     // Streaming proxy check
     const is_messages = std.mem.eql(u8, path, "/v1/messages") and std.mem.eql(u8, method, "POST");
     const is_completions = std.mem.eql(u8, path, "/v1/chat/completions") and std.mem.eql(u8, method, "POST");
-    const wants_stream = (is_messages or is_completions) and
-        (std.mem.indexOf(u8, body, "\"stream\":true") != null or
-        std.mem.indexOf(u8, body, "\"stream\": true") != null);
+    const wants_stream = (is_messages or is_completions) and requestWantsStream(global_allocator, body);
 
     // Auth gate: when AUTH_TOKEN is set, refuse everything but the exempt paths.
     if (auth_token != null and !auth.token_ok and !isExemptPath(method, path)) {
@@ -231,6 +230,22 @@ fn handleConnection(conn_stream: std.net.Stream) void {
     };
     defer if (response.allocated) global_allocator.free(response.body);
     socket.writeResponseFull(conn_stream, response.status, response.extra_headers, response.body, response.content_type);
+}
+
+fn requestWantsStream(allocator: std.mem.Allocator, body: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const stream_value = parsed.value.object.get("stream") orelse return false;
+    return stream_value == .bool and stream_value.bool;
+}
+
+test "stream detection reads only a top-level boolean" {
+    try std.testing.expect(requestWantsStream(std.testing.allocator, "{\"stream\" : true}"));
+    try std.testing.expect(!requestWantsStream(std.testing.allocator, "{\"stream\":false}"));
+    try std.testing.expect(!requestWantsStream(std.testing.allocator, "{\"stream\":\"true\"}"));
+    try std.testing.expect(!requestWantsStream(std.testing.allocator, "{\"nested\":{\"stream\":true}}"));
+    try std.testing.expect(!requestWantsStream(std.testing.allocator, "{not json}"));
 }
 
 const Response = struct {
@@ -408,7 +423,8 @@ fn handleSwitchAccount(body: []const u8) Response {
 
 fn handleUsage() !Response {
     const acc = account_mgr.getCurrent() orelse return .{ .status = 400, .body = "{\"error\":\"no account\"}" };
-    const jwt = try zed.getToken(global_allocator, acc);
+    const jwt = try zed.getTokenCopy(global_allocator, acc);
+    defer global_allocator.free(jwt);
     const claims = try zed.parseJwtClaims(global_allocator, jwt);
     return .{ .status = 200, .body = claims, .allocated = true };
 }
@@ -422,30 +438,32 @@ fn handleBilling() !Response {
 }
 
 fn handleModels() !Response {
+    models_mutex.lock();
+    defer models_mutex.unlock();
     const now = std.time.timestamp();
     if (cached_models_openai) |cached| {
         if (now - cached_models_time < MODELS_CACHE_TTL) {
-            return .{ .status = 200, .body = cached };
+            return .{ .status = 200, .body = try global_allocator.dupe(u8, cached), .allocated = true, .extra_headers = &.{"X-Models-Source: cache"} };
         }
     }
 
     // Fetch from Zed
     const acc = account_mgr.getCurrent() orelse {
         // Fallback to static
-        return .{ .status = 200, .body = @embedFile("models.json") };
+        return .{ .status = 200, .body = @embedFile("models.json"), .extra_headers = &.{"X-Models-Source: static"} };
     };
 
     const raw = zed.fetchModels(global_allocator, acc) catch {
         // Fallback to cache or static
-        if (cached_models_openai) |cached| return .{ .status = 200, .body = cached };
-        return .{ .status = 200, .body = @embedFile("models.json") };
+        if (cached_models_openai) |cached| return .{ .status = 200, .body = try global_allocator.dupe(u8, cached), .allocated = true, .extra_headers = &.{"X-Models-Source: stale"} };
+        return .{ .status = 200, .body = @embedFile("models.json"), .extra_headers = &.{"X-Models-Source: static"} };
     };
     defer global_allocator.free(raw);
 
     // Convert Zed format to OpenAI format
     const openai = convertZedModelsToOpenAI(global_allocator, raw) catch {
-        if (cached_models_openai) |cached| return .{ .status = 200, .body = cached };
-        return .{ .status = 200, .body = @embedFile("models.json") };
+        if (cached_models_openai) |cached| return .{ .status = 200, .body = try global_allocator.dupe(u8, cached), .allocated = true, .extra_headers = &.{"X-Models-Source: stale"} };
+        return .{ .status = 200, .body = @embedFile("models.json"), .extra_headers = &.{"X-Models-Source: static"} };
     };
 
     // Update cache
@@ -454,7 +472,7 @@ fn handleModels() !Response {
     cached_models_time = now;
 
     std.debug.print("[zed2api] models refreshed ({d} bytes)\n", .{openai.len});
-    return .{ .status = 200, .body = openai };
+    return .{ .status = 200, .body = try global_allocator.dupe(u8, openai), .allocated = true, .extra_headers = &.{"X-Models-Source: upstream"} };
 }
 
 fn convertZedModelsToOpenAI(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {

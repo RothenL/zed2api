@@ -5,16 +5,20 @@ const SYSTEM_ID = "6b87ab66-af2c-49c7-b986-ef4c27c9e1fb";
 
 // Global proxy config
 var proxy_initialized: bool = false;
+var proxy_mutex: std.Thread.Mutex = .{};
 var proxy_host: ?[]const u8 = null;
 var proxy_port: u16 = 0;
 
 pub fn init(allocator: std.mem.Allocator) void {
+    proxy_mutex.lock();
+    defer proxy_mutex.unlock();
     if (proxy_initialized) return;
-    proxy_initialized = true;
+    defer proxy_initialized = true;
 
     const env_names = [_][]const u8{ "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy" };
     for (env_names) |name| {
         const val = std.process.getEnvVarOwned(allocator, name) catch continue;
+        defer allocator.free(val);
         if (val.len == 0) continue;
         if (parseProxyUrl(allocator, val)) return;
     }
@@ -25,10 +29,14 @@ pub fn init(allocator: std.mem.Allocator) void {
 }
 
 pub fn getHost() ?[]const u8 {
+    proxy_mutex.lock();
+    defer proxy_mutex.unlock();
     return proxy_host;
 }
 
 pub fn getPort() u16 {
+    proxy_mutex.lock();
+    defer proxy_mutex.unlock();
     return proxy_port;
 }
 
@@ -86,87 +94,86 @@ fn readWindowsSystemProxy(allocator: std.mem.Allocator) void {
     }
 }
 
-/// Send HTTP POST via proxy using curl subprocess
-pub fn sendViaProxy(allocator: std.mem.Allocator, bearer: []const u8, body: []const u8) ![]const u8 {
-    const p_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ proxy_host.?, proxy_port });
-    defer allocator.free(p_url);
-
-    const auth_header = try std.fmt.allocPrint(allocator, "authorization: {s}", .{bearer});
+/// A bounded HTTP request. curl is used for both direct and proxied requests so
+/// neither path can wait indefinitely for a connection or response body.
+pub fn request(allocator: std.mem.Allocator, url: []const u8, auth: []const u8, extra_header: ?[]const u8, body: ?[]const u8, max_seconds: []const u8) ![]u8 {
+    init(allocator);
+    const auth_header = try std.fmt.allocPrint(allocator, "authorization: {s}", .{auth});
     defer allocator.free(auth_header);
 
-    var tmp_name_buf: [64]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_name_buf, "zed2api_req_{d}.json", .{std.time.milliTimestamp()}) catch "zed2api_req_tmp.json";
-    {
-        const f = std.fs.cwd().createFile(tmp_path, .{}) catch return error.UpstreamError;
-        defer f.close();
-        f.writeAll(body) catch return error.UpstreamError;
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(allocator);
+    try args.appendSlice(allocator, &.{ "curl", "-sS", "--connect-timeout", "10", "--max-time", max_seconds, "-w", "\n__HTTP_STATUS__%{http_code}" });
+    var proxy_url: ?[]u8 = null;
+    defer if (proxy_url) |p| allocator.free(p);
+    if (getHost()) |host| {
+        proxy_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ host, getPort() });
+        try args.appendSlice(allocator, &.{ "-x", proxy_url.?, "--noproxy", "" });
+    } else {
+        // Ignore curl's implicit environment proxy when our proxy discovery found none.
+        try args.appendSlice(allocator, &.{ "--proxy", "" });
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    try args.appendSlice(allocator, &.{ "-H", auth_header });
+    if (extra_header) |header| try args.appendSlice(allocator, &.{ "-H", header });
 
-    const at_path = try std.fmt.allocPrint(allocator, "@{s}", .{tmp_path});
-    defer allocator.free(at_path);
+    var temp_path: ?[]u8 = null;
+    defer if (temp_path) |p| {
+        std.fs.cwd().deleteFile(p) catch {};
+        allocator.free(p);
+    };
+    var at_path: ?[]u8 = null;
+    defer if (at_path) |p| allocator.free(p);
+    if (body) |payload| {
+        try args.appendSlice(allocator, &.{ "-X", "POST", "-H", "content-type: application/json" });
+        // A random exclusive name prevents simultaneous requests overwriting each other.
+        var random_bytes: [16]u8 = undefined;
+        while (true) {
+            std.crypto.random.bytes(&random_bytes);
+            const name = try std.fmt.allocPrint(allocator, "zed2api_req_{s}.json", .{std.fmt.bytesToHex(random_bytes, .lower)});
+            const file = std.fs.cwd().createFile(name, .{ .exclusive = true }) catch |err| {
+                allocator.free(name);
+                if (err == error.PathAlreadyExists) continue;
+                return error.UpstreamError;
+            };
+            temp_path = name;
+            file.writeAll(payload) catch {
+                file.close();
+                return error.UpstreamError;
+            };
+            file.close();
+            break;
+        }
+        at_path = try std.fmt.allocPrint(allocator, "@{s}", .{temp_path.?});
+        try args.appendSlice(allocator, &.{ "--data-binary", at_path.? });
+    }
+    try args.append(allocator, url);
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{
-            "curl",           "-s",
-            "-x",             p_url,
-            "-X",             "POST",
-            "https://cloud.zed.dev/completions",
-            "-H",             auth_header,
-            "-H",             "content-type: application/json",
-            "-H",             "x-zed-version: 0.222.4+stable.147.b385025df963c9e8c3f74cc4dadb1c4b29b3c6f0",
-            "--data-binary",  at_path,
-            "--max-time",     "120",
-            "-w",             "\n__HTTP_STATUS__%{http_code}",
-        },
+        .argv = args.items,
         .max_output_bytes = 4 * 1024 * 1024,
     }) catch return error.UpstreamError;
     defer allocator.free(result.stderr);
-
+    defer allocator.free(result.stdout);
     if (result.term != .Exited or result.term.Exited != 0) {
         std.debug.print("[zed] curl failed: {s}\n", .{result.stderr});
-        allocator.free(result.stdout);
         return error.UpstreamError;
     }
-
-    if (result.stdout.len == 0) {
-        std.debug.print("[zed] proxy: empty response, stderr={s}\n", .{result.stderr});
-        allocator.free(result.stdout);
+    const marker = "\n__HTTP_STATUS__";
+    const pos = std.mem.lastIndexOf(u8, result.stdout, marker) orelse return error.UpstreamError;
+    const status = std.fmt.parseInt(u16, result.stdout[pos + marker.len ..], 10) catch return error.UpstreamError;
+    const response_body = result.stdout[0..pos];
+    if (status == 401 or status == 403) return error.TokenExpired;
+    if (status == 429) return error.RateLimited;
+    if (status != 200 or response_body.len == 0) {
+        std.debug.print("[zed] upstream status {d}: {s}\n", .{ status, response_body[0..@min(response_body.len, 500)] });
         return error.UpstreamError;
     }
+    return allocator.dupe(u8, response_body);
+}
 
-    var response_body = result.stdout;
-    var http_status: []const u8 = "unknown";
-    if (std.mem.lastIndexOf(u8, result.stdout, "\n__HTTP_STATUS__")) |pos| {
-        response_body = result.stdout[0..pos];
-        http_status = result.stdout[pos + "\n__HTTP_STATUS__".len ..];
-    }
-
-    if (response_body.len == 0) {
-        std.debug.print("[zed] proxy: empty body with status {s}\n", .{http_status});
-        allocator.free(result.stdout);
-        return error.UpstreamError;
-    }
-
-    if (std.mem.startsWith(u8, response_body, "<html>") or std.mem.startsWith(u8, response_body, "<!DOCTYPE")) {
-        std.debug.print("[zed] proxy: HTML error response (status={s})\n", .{http_status});
-        allocator.free(result.stdout);
-        return error.UpstreamError;
-    }
-
-    if (std.mem.startsWith(u8, response_body, "{\"error\"") or std.mem.startsWith(u8, response_body, "{\"detail\"")) {
-        std.debug.print("[zed] upstream error (status={s}): {s}\n", .{ http_status, response_body[0..@min(response_body.len, 500)] });
-        allocator.free(result.stdout);
-        return error.UpstreamError;
-    }
-
-    const owned = allocator.dupe(u8, response_body) catch {
-        allocator.free(result.stdout);
-        return error.UpstreamError;
-    };
-    allocator.free(result.stdout);
-    return owned;
+pub fn sendViaProxy(allocator: std.mem.Allocator, bearer: []const u8, body: []const u8) ![]const u8 {
+    return request(allocator, "https://cloud.zed.dev/completions", bearer, "x-zed-version: 0.222.4+stable.147.b385025df963c9e8c3f74cc4dadb1c4b29b3c6f0", body, "120");
 }
 
 /// Send HTTP POST to Zed with retry logic
@@ -174,60 +181,14 @@ pub fn sendToZed(allocator: std.mem.Allocator, jwt: []const u8, body: []const u8
     const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt});
     defer allocator.free(bearer);
 
-    init(allocator);
-
     var attempt: u8 = 0;
     while (attempt < 3) : (attempt += 1) {
-        const result = if (proxy_host != null) blk: {
-            break :blk sendViaProxy(allocator, bearer, body);
-        } else blk: {
-            var response_buf: std.io.Writer.Allocating = .init(allocator);
-            errdefer response_buf.deinit();
-
-            var client: std.http.Client = .{ .allocator = allocator };
-            defer client.deinit();
-
-            const fetch_result = client.fetch(.{
-                .location = .{ .url = "https://cloud.zed.dev/completions" },
-                .method = .POST,
-                .payload = body,
-                .response_writer = &response_buf.writer,
-                .extra_headers = &.{
-                    .{ .name = "authorization", .value = bearer },
-                    .{ .name = "content-type", .value = "application/json" },
-                    .{ .name = "x-zed-version", .value = "0.222.4+stable.147.b385025df963c9e8c3f74cc4dadb1c4b29b3c6f0" },
-                },
-            }) catch |err| {
-                std.debug.print("[zed] network error attempt {d}: {}\n", .{ attempt + 1, err });
-                response_buf.deinit();
-                break :blk @as(anyerror![]const u8, error.UpstreamError);
-            };
-
-            if (fetch_result.status == .ok) {
-                break :blk @as(anyerror![]const u8, response_buf.toOwnedSlice() catch {
-                    response_buf.deinit();
-                    break :blk @as(anyerror![]const u8, error.UpstreamError);
-                });
-            }
-
-            const err_body = response_buf.written();
-            std.debug.print("[zed] upstream {d} attempt {d}: {s}\n", .{ @intFromEnum(fetch_result.status), attempt + 1, err_body });
-            response_buf.deinit();
-
-            if (fetch_result.status == .unauthorized or fetch_result.status == .forbidden) {
-                break :blk @as(anyerror![]const u8, error.TokenExpired);
-            }
-            if (fetch_result.status == .too_many_requests) {
-                break :blk @as(anyerror![]const u8, error.RateLimited);
-            }
-            break :blk @as(anyerror![]const u8, error.UpstreamError);
-        };
-
+        const result = sendViaProxy(allocator, bearer, body);
         if (result) |data| {
             return data;
         } else |err| {
             std.debug.print("[zed] attempt {d} error: {}\n", .{ attempt + 1, err });
-            if (err == error.TokenExpired) return error.TokenExpired;
+            if (err == error.TokenExpired) return err;
             if (err == error.RateLimited) {
                 if (attempt < 2) std.Thread.sleep(3_000_000_000);
                 continue;

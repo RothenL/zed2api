@@ -5,19 +5,15 @@ const proxy = @import("proxy.zig");
 const providers = @import("providers.zig");
 const socket = @import("socket.zig");
 
-/// Handle streaming proxy with account failover
-pub fn handleStreamProxy(
-    client_stream: std.net.Stream,
-    body: []const u8,
-    is_anthropic: bool,
-    account_mgr: *accounts.AccountManager,
-    allocator: std.mem.Allocator,
-) void {
+const sse_header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\n\r\n";
+
+/// Handle streaming proxy with account failover. Failover is permitted only before
+/// any response bytes have been sent to the client.
+pub fn handleStreamProxy(client_stream: std.net.Stream, body: []const u8, is_anthropic: bool, account_mgr: *accounts.AccountManager, allocator: std.mem.Allocator) void {
     if (account_mgr.list.items.len == 0) {
         socket.writeResponse(client_stream, 400, "{\"error\":\"no account configured\"}");
         return;
     }
-
     const total = account_mgr.list.items.len;
     var try_order: [64]usize = undefined;
     const count = @min(total, 64);
@@ -29,71 +25,75 @@ pub fn handleStreamProxy(
             idx += 1;
         }
     }
-
     for (try_order[0..count]) |acc_idx| {
         const acc = &account_mgr.list.items[acc_idx];
-        if (doStreamProxy(client_stream, acc, body, is_anthropic, allocator)) {
-            if (acc_idx != account_mgr.current) {
-                std.debug.print("[zed2api] stream failover: switched to '{s}'\n", .{acc.name});
-                account_mgr.current = acc_idx;
-            }
+        const result = doStreamProxy(client_stream, acc, body, is_anthropic, allocator);
+        if (result != .retry) {
+            if (result == .success and acc_idx != account_mgr.current) account_mgr.current = acc_idx;
             return;
-        } else {
-            std.debug.print("[zed2api] stream: account '{s}' failed, trying next...\n", .{acc.name});
         }
+        std.debug.print("[zed2api] stream: account '{s}' failed, trying next...\n", .{acc.name});
     }
-
     socket.writeResponse(client_stream, 502, "{\"error\":{\"message\":\"All accounts failed\",\"type\":\"upstream_error\"}}");
 }
 
-fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []const u8, is_anthropic: bool, allocator: std.mem.Allocator) bool {
-    const payload = providers.buildZedPayload(allocator, body, is_anthropic) catch |err| {
-        std.debug.print("[stream] buildZedPayload failed: {}\n", .{err});
-        return false;
-    };
+const Attempt = enum { retry, success, sent_failure };
+
+fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []const u8, is_anthropic: bool, allocator: std.mem.Allocator) Attempt {
+    const payload = providers.buildZedPayload(allocator, body, is_anthropic) catch return .retry;
     defer allocator.free(payload);
-
-    const jwt = zed.getToken(allocator, acc) catch |err| {
-        std.debug.print("[stream] getToken failed: {}\n", .{err});
-        return false;
-    };
-    const bearer = std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt}) catch return false;
+    const jwt = zed.getTokenCopy(allocator, acc) catch return .retry;
+    defer allocator.free(jwt);
+    const bearer = std.fmt.allocPrint(allocator, "authorization: Bearer {s}", .{jwt}) catch return .retry;
     defer allocator.free(bearer);
-
-    const auth_header = std.fmt.allocPrint(allocator, "authorization: {s}", .{bearer}) catch return false;
-    defer allocator.free(auth_header);
-
     proxy.init(allocator);
 
-    // Write payload to temp file
     var tmp_name_buf: [64]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_name_buf, "zed2api_stream_{d}.json", .{std.time.milliTimestamp()}) catch "zed2api_stream_req.json";
-    {
-        const f = std.fs.cwd().createFile(tmp_path, .{}) catch return false;
-        defer f.close();
-        f.writeAll(payload) catch return false;
+    var tmp_path: []const u8 = undefined;
+    while (true) {
+        tmp_path = std.fmt.bufPrint(&tmp_name_buf, "zed2api_stream_{x}.json", .{std.crypto.random.int(u128)}) catch return .retry;
+        const file = std.fs.cwd().createFile(tmp_path, .{ .exclusive = true }) catch |err| {
+            if (err == error.PathAlreadyExists) continue;
+            return .retry;
+        };
+        file.writeAll(payload) catch {
+            file.close();
+            std.fs.cwd().deleteFile(tmp_path) catch {};
+            return .retry;
+        };
+        file.close();
+        break;
     }
     defer std.fs.cwd().deleteFile(tmp_path) catch {};
-
-    const at_path = std.fmt.allocPrint(allocator, "@{s}", .{tmp_path}) catch return false;
+    const at_path = std.fmt.allocPrint(allocator, "@{s}", .{tmp_path}) catch return .retry;
     defer allocator.free(at_path);
-
     const proxy_url = if (proxy.getHost()) |host|
-        (std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ host, proxy.getPort() }) catch return false)
+        (std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ host, proxy.getPort() }) catch return .retry)
     else
         null;
     defer if (proxy_url) |p| allocator.free(p);
 
-    var argv_buf: [20][]const u8 = undefined;
+    var argv_buf: [28][]const u8 = undefined;
     var argc: usize = 0;
     argv_buf[argc] = "curl"; argc += 1;
     argv_buf[argc] = "-siN"; argc += 1;
-    if (proxy_url) |p| { argv_buf[argc] = "-x"; argc += 1; argv_buf[argc] = p; argc += 1; }
+    argv_buf[argc] = "--suppress-connect-headers"; argc += 1;
+    argv_buf[argc] = "--connect-timeout"; argc += 1;
+    argv_buf[argc] = "10"; argc += 1;
+    if (proxy_url) |p| {
+        argv_buf[argc] = "-x"; argc += 1;
+        argv_buf[argc] = p; argc += 1;
+        argv_buf[argc] = "--noproxy"; argc += 1;
+        argv_buf[argc] = ""; argc += 1;
+    } else {
+        argv_buf[argc] = "--proxy"; argc += 1;
+        argv_buf[argc] = ""; argc += 1;
+    }
     argv_buf[argc] = "-X"; argc += 1;
     argv_buf[argc] = "POST"; argc += 1;
     argv_buf[argc] = "https://cloud.zed.dev/completions"; argc += 1;
     argv_buf[argc] = "-H"; argc += 1;
-    argv_buf[argc] = auth_header; argc += 1;
+    argv_buf[argc] = bearer; argc += 1;
     argv_buf[argc] = "-H"; argc += 1;
     argv_buf[argc] = "content-type: application/json"; argc += 1;
     argv_buf[argc] = "-H"; argc += 1;
@@ -105,268 +105,414 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.spawn() catch return false;
-
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return .retry;
     const stdout = child.stdout orelse {
         _ = child.wait() catch {};
-        return false;
+        return .retry;
     };
-
+    const request = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch null;
+    defer if (request) |r| r.deinit();
+    const model = if (request) |r| (if (r.value == .object) providers.extractModel(r.value) else "claude-sonnet-4-5") else "claude-sonnet-4-5";
+    var state = StreamState{ .anthropic = is_anthropic, .model = model };
+    var headers_sent = false;
+    var http_status: u16 = 0;
+    var in_headers = true;
     var line_buf: [65536]u8 = undefined;
     var line_len: usize = 0;
-    var block_index: usize = 0;
-    var got_any_data = false;
-    var headers_sent = false;
-    var has_tool_use = false;
-    var http_headers_done = false;
-    var http_status: u16 = 0;
-
-    const model = providers.extractModelFromBody(allocator, body) catch "claude-sonnet-4-5";
+    var read_failed = false;
+    var overflow = false;
+    var completed = false;
 
     while (true) {
         var one: [1]u8 = undefined;
-        const n = stdout.read(&one) catch break;
+        const n = stdout.read(&one) catch { read_failed = true; break; };
         if (n == 0) break;
-
-        if (one[0] == '\n') {
-            if (!http_headers_done) {
-                // Parse HTTP response headers from curl -i
-                const line = line_buf[0..line_len];
-                // Trim trailing \r
-                const trimmed = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
-                if (trimmed.len == 0) {
-                    // Empty line = end of HTTP headers
-                    http_headers_done = true;
-                    if (http_status != 0 and http_status != 200) {
-                        std.debug.print("[stream] upstream HTTP {d}\n", .{http_status});
-                    }
-                } else if (std.mem.startsWith(u8, trimmed, "HTTP/")) {
-                    // Parse status code from "HTTP/1.1 200 OK" or "HTTP/2 200"
-                    var parts = std.mem.splitScalar(u8, trimmed, ' ');
-                    _ = parts.next(); // skip HTTP/x.x
-                    if (parts.next()) |code_str| {
-                        http_status = std.fmt.parseInt(u16, code_str, 10) catch 0;
-                    }
-                }
-                line_len = 0;
-                continue;
-            }
-
-            if (line_len > 0) {
-                const line = line_buf[0..line_len];
-                if (line[0] == '{') {
-                    // Check if this is an error response (non-200 status)
-                    if (http_status != 0 and http_status != 200) {
-                        std.debug.print("[stream] upstream error HTTP {d}: {s}\n", .{ http_status, line[0..@min(line.len, 500)] });
-                        line_len = 0;
-                        continue;
-                    }
-                    if (!headers_sent) {
-                        headers_sent = true;
-                        const sse_header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\n\r\n";
-                        socket.send(client_stream, sse_header) catch {
-                            _ = child.wait() catch {};
-                            return false;
-                        };
-                        var msg_start_buf: [512]u8 = undefined;
-                        const msg_start = std.fmt.bufPrint(&msg_start_buf, "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_zed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{s}\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n", .{model}) catch "";
-                        socket.send(client_stream, msg_start) catch {};
-                    }
-                    got_any_data = true;
-                    convertAndSendSSE(client_stream, line, &block_index, &has_tool_use, allocator) catch break;
-                } else {
-                    std.debug.print("[stream] non-JSON from upstream ({d} bytes): {s}\n", .{ line.len, line[0..@min(line.len, 500)] });
-                }
-            }
-            line_len = 0;
-        } else {
+        if (one[0] != '\n') {
             if (line_len < line_buf.len) {
                 line_buf[line_len] = one[0];
                 line_len += 1;
+            } else overflow = true;
+            continue;
+        }
+        const raw = line_buf[0..line_len];
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        line_len = 0;
+        if (overflow) { overflow = false; read_failed = true; break; }
+        if (in_headers) {
+            if (std.mem.startsWith(u8, line, "HTTP/")) {
+                var parts = std.mem.tokenizeScalar(u8, line, ' ');
+                _ = parts.next();
+                http_status = if (parts.next()) |code| std.fmt.parseInt(u16, code, 10) catch 0 else 0;
+            } else if (line.len == 0) {
+                // curl may include 100 Continue or proxy CONNECT headers before the final response.
+                if (http_status >= 200 or http_status == 0) in_headers = false;
             }
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "HTTP/")) {
+            in_headers = true;
+            var parts = std.mem.tokenizeScalar(u8, line, ' ');
+            _ = parts.next();
+            http_status = if (parts.next()) |code| std.fmt.parseInt(u16, code, 10) catch 0 else 0;
+            continue;
+        }
+        if (http_status != 200 or line.len == 0) continue;
+        const data_line = if (std.mem.startsWith(u8, line, "data: ")) line[6..] else line;
+        if (std.mem.eql(u8, data_line, "[DONE]")) { completed = true; continue; }
+        if (isTerminalEvent(data_line, allocator)) completed = true;
+        var out: std.io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        convertLine(&out.writer, &state, data_line, allocator) catch { read_failed = true; break; };
+        if (out.written().len == 0) continue;
+        if (!headers_sent) {
+            socket.send(client_stream, sse_header) catch { read_failed = true; break; };
+            headers_sent = true;
+        }
+        socket.send(client_stream, out.written()) catch { read_failed = true; break; };
+    }
+    // A final JSON line need not be newline-terminated.
+    if (overflow) read_failed = true;
+    if (!read_failed and line_len > 0 and !in_headers and http_status == 200) {
+        var out: std.io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const raw_last = std.mem.trimEnd(u8, line_buf[0..line_len], "\r");
+        const last = if (std.mem.startsWith(u8, raw_last, "data: ")) raw_last[6..] else raw_last;
+        if (std.mem.eql(u8, last, "[DONE]")) completed = true;
+        if (isTerminalEvent(last, allocator)) completed = true;
+        if (!std.mem.eql(u8, last, "[DONE]")) convertLine(&out.writer, &state, last, allocator) catch { read_failed = true; };
+        if (!read_failed and out.written().len > 0) {
+            if (!headers_sent) {
+                if (socket.send(client_stream, sse_header)) |_| { headers_sent = true; } else |_| { read_failed = true; }
+            }
+            if (!read_failed) socket.send(client_stream, out.written()) catch { read_failed = true; };
         }
     }
-
-    if (headers_sent) {
-        const stop_reason = if (has_tool_use) "tool_use" else "end_turn";
-        var stop_buf: [256]u8 = undefined;
-        const stop_msg = std.fmt.bufPrint(&stop_buf, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n", .{stop_reason}) catch "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
-        socket.send(client_stream, stop_msg) catch {};
-        socket.send(client_stream, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") catch {};
-    }
-
-    const stderr_pipe = child.stderr;
-    var stderr_buf: [2048]u8 = undefined;
-    var stderr_len: usize = 0;
-    if (stderr_pipe) |sp| {
-        stderr_len = sp.read(&stderr_buf) catch 0;
-    }
-    const term = child.wait() catch {
-        std.debug.print("[stream] done, {d} blocks, headers_sent={}, wait failed\n", .{ block_index, headers_sent });
-        return got_any_data;
-    };
-    const exit_code: u32 = switch (term) {
-        .Exited => |c| c,
-        else => 999,
-    };
-    if (!got_any_data or exit_code != 0) {
-        std.debug.print("[stream] done, {d} blocks, headers_sent={}, curl exit={d}, http={d}, stderr={s}\n", .{ block_index, headers_sent, exit_code, http_status, stderr_buf[0..stderr_len] });
-        // If we got no data, print any remaining buffered content for debugging
-        if (!got_any_data and line_len > 0) {
-            std.debug.print("[stream] remaining buffer ({d} bytes): {s}\n", .{ line_len, line_buf[0..@min(line_len, 500)] });
+    const term = child.wait() catch blk: { read_failed = true; break :blk null; };
+    const exit_ok = if (term) |t| switch (t) { .Exited => |code| code == 0, else => false } else false;
+    if (http_status != 200 or !exit_ok or read_failed or state.failed or !state.started or !completed) {
+        std.debug.print("[stream] failed: http={d}, curl_ok={}, read_failed={}, completed={}\n", .{ http_status, exit_ok, read_failed, completed });
+        if (!headers_sent) return .retry;
+        if (!state.failed and !read_failed) {
+            var out: std.io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            emitError(&out.writer, &state, "Upstream stream interrupted") catch {};
+            socket.send(client_stream, out.written()) catch {};
         }
-    } else {
-        std.debug.print("[stream] done, {d} blocks\n", .{block_index});
+        if (!state.anthropic) socket.send(client_stream, "data: [DONE]\n\n") catch {};
+        return .sent_failure;
     }
-    return got_any_data;
+    var end: std.io.Writer.Allocating = .init(allocator);
+    defer end.deinit();
+    finish(&end.writer, &state) catch return .sent_failure;
+    socket.send(client_stream, end.written()) catch return .sent_failure;
+    return .success;
 }
 
-/// Convert a single Zed streaming JSON line to Anthropic SSE events
-fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_index: *usize, has_tool_use: *bool, allocator: std.mem.Allocator) !void {
+const StreamState = struct {
+    anthropic: bool,
+    model: []const u8,
+    started: bool = false,
+    failed: bool = false,
+    tool_seen: bool = false,
+    tool_index: usize = 0,
+    block_index: usize = 0,
+    block_open: bool = false,
+    text_open: bool = false,
+    finish_reason: ?[]const u8 = null,
+};
+
+fn start(w: *std.io.Writer, state: *StreamState) !void {
+    if (state.started) return;
+    state.started = true;
+    if (state.anthropic) {
+        try w.writeAll("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_zed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":");
+        try std.json.Stringify.encodeJsonString(state.model, .{}, w);
+        try w.writeAll(",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n");
+    } else {
+        try chunkPrefix(w, state);
+        try w.writeAll("{\"role\":\"assistant\"}");
+        try chunkEnd(w, null);
+    }
+}
+
+fn chunkPrefix(w: *std.io.Writer, state: *const StreamState) !void {
+    try w.writeAll("data: {\"id\":\"chatcmpl-zed\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":");
+    try std.json.Stringify.encodeJsonString(state.model, .{}, w);
+    try w.writeAll(",\"choices\":[{\"index\":0,\"delta\":");
+}
+fn chunkEnd(w: *std.io.Writer, reason: ?[]const u8) !void {
+    try w.writeAll(",\"finish_reason\":");
+    if (reason) |r| try std.json.Stringify.encodeJsonString(r, .{}, w) else try w.writeAll("null");
+    try w.writeAll("}]}\n\n");
+}
+fn text(w: *std.io.Writer, state: *StreamState, content: []const u8) !void {
+    if (content.len == 0) return;
+    try start(w, state);
+    if (state.anthropic) {
+        if (!state.text_open) {
+            try w.print("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n", .{state.block_index});
+            state.text_open = true;
+            state.block_open = true;
+        }
+        try w.print("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"text_delta\",\"text\":", .{state.block_index});
+        try std.json.Stringify.encodeJsonString(content, .{}, w);
+        try w.writeAll("}}\n\n");
+    } else {
+        try chunkPrefix(w, state);
+        try w.writeAll("{\"content\":");
+        try std.json.Stringify.encodeJsonString(content, .{}, w);
+        try w.writeAll("}");
+        try chunkEnd(w, null);
+    }
+}
+fn stopBlock(w: *std.io.Writer, state: *StreamState) !void {
+    if (!state.anthropic or !state.block_open) return;
+    try w.print("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n", .{state.block_index});
+    state.block_index += 1;
+    state.block_open = false;
+    state.text_open = false;
+}
+fn toolStart(w: *std.io.Writer, state: *StreamState, id: std.json.Value, name: std.json.Value) !void {
+    if (id != .string or name != .string) return;
+    try start(w, state);
+    state.tool_seen = true;
+    if (state.anthropic) {
+        try stopBlock(w, state);
+        try w.print("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"tool_use\",\"id\":", .{state.block_index});
+        try std.json.Stringify.value(id, .{}, w);
+        try w.writeAll(",\"name\":");
+        try std.json.Stringify.value(name, .{}, w);
+        try w.writeAll(",\"input\":{}}}\n\n");
+        state.block_open = true;
+    } else {
+        try chunkPrefix(w, state);
+        try w.print("{{\"tool_calls\":[{{\"index\":{d},\"id\":", .{state.tool_index});
+        try std.json.Stringify.value(id, .{}, w);
+        try w.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+        try std.json.Stringify.value(name, .{}, w);
+        try w.writeAll(",\"arguments\":\"\"}}]}");
+        try chunkEnd(w, null);
+        state.tool_index += 1;
+    }
+}
+fn toolArguments(w: *std.io.Writer, state: *StreamState, arguments: []const u8) !void {
+    if (arguments.len == 0) return;
+    try start(w, state);
+    if (state.anthropic) {
+        try w.print("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":", .{state.block_index});
+        try std.json.Stringify.encodeJsonString(arguments, .{}, w);
+        try w.writeAll("}}\n\n");
+    } else {
+        try chunkPrefix(w, state);
+        try w.print("{{\"tool_calls\":[{{\"index\":{d},\"function\":{{\"arguments\":", .{if (state.tool_index > 0) state.tool_index - 1 else 0});
+        try std.json.Stringify.encodeJsonString(arguments, .{}, w);
+        try w.writeAll("}}]}");
+        try chunkEnd(w, null);
+    }
+}
+fn emitError(w: *std.io.Writer, state: *StreamState, message: []const u8) !void {
+    state.failed = true;
+    if (state.anthropic) try w.writeAll("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":") else try w.writeAll("data: {\"error\":{\"type\":\"upstream_error\",\"message\":");
+    try std.json.Stringify.encodeJsonString(message, .{}, w);
+    try w.writeAll("}}\n\n");
+}
+fn finish(w: *std.io.Writer, state: *StreamState) !void {
+    if (state.anthropic) {
+        try stopBlock(w, state);
+        try w.writeAll("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
+        const reason = state.finish_reason orelse if (state.tool_seen) "tool_use" else "end_turn";
+        try std.json.Stringify.encodeJsonString(reason, .{}, w);
+        try w.writeAll("},\"usage\":{\"output_tokens\":0}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    } else {
+        try chunkPrefix(w, state);
+        try w.writeAll("{}");
+        try chunkEnd(w, state.finish_reason orelse if (state.tool_seen) "tool_calls" else "stop");
+        try w.writeAll("data: [DONE]\n\n");
+    }
+}
+
+fn isTerminalEvent(line: []const u8, allocator: std.mem.Allocator) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const obj = if (parsed.value.object.get("event")) |event| (if (event == .object) event else parsed.value) else parsed.value;
+    const kind = obj.object.get("type") orelse return false;
+    if (kind != .string) return false;
+    return std.mem.eql(u8, kind.string, "response.completed") or std.mem.eql(u8, kind.string, "message_stop");
+}
+
+/// Convert one JSON line from Zed. All output goes through a writer so this
+/// conversion can be tested independently of sockets and curl.
+fn convertLine(w: *std.io.Writer, state: *StreamState, line: []const u8, allocator: std.mem.Allocator) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return;
     defer parsed.deinit();
-
-    const obj = if (parsed.value.object.get("event")) |event|
-        (if (event == .object) event else parsed.value)
-    else
-        parsed.value;
-
-    if (obj.object.get("type")) |et_val| {
-        if (et_val == .string) {
-            const event_type = et_val.string;
-
-            if (std.mem.eql(u8, event_type, "message_start")) {
-                if (obj.object.get("message")) |msg| {
-                    if (msg == .object) {
-                        if (msg.object.get("model")) |m| {
-                            if (m == .string) std.debug.print("[stream] zed returned model: {s}\n", .{m.string});
-                        }
+    if (parsed.value != .object) return;
+    const obj = if (parsed.value.object.get("event")) |event| (if (event == .object) event else parsed.value) else parsed.value;
+    const kind = if (obj.object.get("type")) |v| (if (v == .string) v.string else "") else "";
+    if (std.mem.eql(u8, kind, "error") or std.mem.eql(u8, kind, "response.failed")) {
+        var message: []const u8 = "Upstream error";
+        if (obj.object.get("error")) |err| {
+            if (err == .object) {
+                if (err.object.get("message")) |m| { if (m == .string) message = m.string; }
+            } else if (err == .string) message = err.string;
+        }
+        if (state.started) try emitError(w, state, message) else state.failed = true;
+        return;
+    }
+    if (state.failed) return;
+    if (std.mem.eql(u8, kind, "message_start") or std.mem.eql(u8, kind, "response.created")) { try start(w, state); return; }
+    if (std.mem.eql(u8, kind, "response.completed") or std.mem.eql(u8, kind, "message_stop")) return;
+    if (std.mem.eql(u8, kind, "message_delta")) {
+        if (obj.object.get("delta")) |d| {
+            if (d == .object) {
+                if (d.object.get("stop_reason")) |r| {
+                    if (r == .string) {
+                        if (std.mem.eql(u8, r.string, "tool_use")) state.finish_reason = if (state.anthropic) "tool_use" else "tool_calls"
+                        else if (std.mem.eql(u8, r.string, "max_tokens")) state.finish_reason = if (state.anthropic) "max_tokens" else "length"
+                        else state.finish_reason = if (state.anthropic) "end_turn" else "stop";
                     }
                 }
-                return;
-            }
-
-            if (std.mem.eql(u8, event_type, "content_block_start")) {
-                const cb = obj.object.get("content_block") orelse return;
-                if (cb != .object) return;
-                const cb_type = switch (cb.object.get("type") orelse return) { .string => |s| s, else => return };
-                var buf: std.io.Writer.Allocating = .init(allocator);
-                defer buf.deinit();
-                const w = &buf.writer;
-                if (std.mem.eql(u8, cb_type, "tool_use")) {
-                    has_tool_use.* = true;
-                    // Pass through tool_use content_block_start with id and name
-                    try w.print("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"tool_use\"", .{block_index.*});
-                    if (cb.object.get("id")) |id| {
-                        try w.writeAll(",\"id\":"); try std.json.Stringify.value(id, .{}, w);
-                    }
-                    if (cb.object.get("name")) |name| {
-                        try w.writeAll(",\"name\":"); try std.json.Stringify.value(name, .{}, w);
-                    }
-                    try w.writeAll(",\"input\":{}}}\n\n");
-                } else {
-                    try w.print("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"{s}\"", .{ block_index.*, cb_type });
-                    if (std.mem.eql(u8, cb_type, "thinking")) try w.writeAll(",\"thinking\":\"\"") else try w.writeAll(",\"text\":\"\"");
-                    try w.writeAll("}}\n\n");
-                }
-                try socket.send(client_stream, buf.written());
-                return;
-            }
-
-            if (std.mem.eql(u8, event_type, "content_block_delta")) {
-                const delta = obj.object.get("delta") orelse return;
-                if (delta != .object) return;
-                var buf: std.io.Writer.Allocating = .init(allocator);
-                defer buf.deinit();
-                const w = &buf.writer;
-                try w.print("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":", .{block_index.*});
-                try std.json.Stringify.value(delta, .{}, w);
-                try w.writeAll("}\n\n");
-                try socket.send(client_stream, buf.written());
-                return;
-            }
-
-            if (std.mem.eql(u8, event_type, "content_block_stop")) {
-                var buf: [256]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n", .{block_index.*}) catch return;
-                try socket.send(client_stream, msg);
-                block_index.* += 1;
-                return;
-            }
-
-            if (std.mem.eql(u8, event_type, "ping")) {
-                try socket.send(client_stream, "event: ping\ndata: {\"type\":\"ping\"}\n\n");
-                return;
-            }
-
-            if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
-                if (obj.object.get("delta")) |d| {
-                    if (d == .string and d.string.len > 0) {
-                        try emitTextDelta(client_stream, d.string, block_index, allocator);
-                    }
-                }
-                return;
             }
         }
+        return;
     }
-
-    // xAI (Grok)
+    if (std.mem.eql(u8, kind, "content_block_start")) {
+        const cb = obj.object.get("content_block") orelse return;
+        if (cb != .object) return;
+        const t = cb.object.get("type") orelse return;
+        if (t != .string) return;
+        if (std.mem.eql(u8, t.string, "tool_use")) {
+            try toolStart(w, state, cb.object.get("id") orelse return, cb.object.get("name") orelse return);
+        } else if (state.anthropic) {
+            try start(w, state);
+            try stopBlock(w, state);
+            try w.print("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":", .{state.block_index});
+            try std.json.Stringify.value(t, .{}, w);
+            if (std.mem.eql(u8, t.string, "thinking")) try w.writeAll(",\"thinking\":\"\"}}\n\n") else try w.writeAll(",\"text\":\"\"}}\n\n");
+            state.block_open = true;
+            state.text_open = std.mem.eql(u8, t.string, "text");
+        }
+        return;
+    }
+    if (std.mem.eql(u8, kind, "content_block_stop")) { try stopBlock(w, state); return; }
+    if (std.mem.eql(u8, kind, "content_block_delta")) {
+        const d = obj.object.get("delta") orelse return;
+        if (d != .object) return;
+        const dt = d.object.get("type") orelse return;
+        if (dt != .string) return;
+        if (std.mem.eql(u8, dt.string, "text_delta")) {
+            if (d.object.get("text")) |v| { if (v == .string) try text(w, state, v.string); }
+        } else if (std.mem.eql(u8, dt.string, "input_json_delta")) {
+            if (d.object.get("partial_json")) |v| { if (v == .string) try toolArguments(w, state, v.string); }
+        } else if (state.anthropic and std.mem.eql(u8, dt.string, "thinking_delta")) {
+            try start(w, state);
+            try w.print("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":", .{state.block_index});
+            try std.json.Stringify.value(d, .{}, w);
+            try w.writeAll("}\n\n");
+        }
+        return;
+    }
+    if (std.mem.eql(u8, kind, "response.output_text.delta")) {
+        if (obj.object.get("delta")) |v| { if (v == .string) try text(w, state, v.string); }
+        return;
+    }
     if (obj.object.get("choices")) |choices| {
-        if (choices == .array and choices.array.items.len > 0) {
-            const choice = choices.array.items[0];
-            if (choice == .object) {
-                if (choice.object.get("delta")) |delta| {
-                    if (delta == .object) {
-                        if (delta.object.get("content")) |c| {
-                            if (c == .string and c.string.len > 0) {
-                                try emitTextDelta(client_stream, c.string, block_index, allocator);
-                            }
-                        }
-                    }
-                }
+        if (choices != .array or choices.array.items.len == 0) return;
+        const choice = choices.array.items[0];
+        if (choice != .object) return;
+        if (choice.object.get("finish_reason")) |reason| {
+            if (reason == .string) {
+                if (std.mem.eql(u8, reason.string, "tool_calls")) state.finish_reason = if (state.anthropic) "tool_use" else "tool_calls"
+                else if (std.mem.eql(u8, reason.string, "length")) state.finish_reason = if (state.anthropic) "max_tokens" else "length"
+                else state.finish_reason = if (state.anthropic) "end_turn" else "stop";
             }
+        }
+        const d = choice.object.get("delta") orelse return;
+        if (d != .object) return;
+        if (d.object.get("content")) |v| { if (v == .string) try text(w, state, v.string); }
+        if (d.object.get("tool_calls")) |calls| {
+            if (calls == .array) for (calls.array.items) |call| {
+                if (call != .object) continue;
+                const func = call.object.get("function") orelse continue;
+                if (func != .object) continue;
+                if (call.object.get("id")) |id| {
+                    if (func.object.get("name")) |name| try toolStart(w, state, id, name);
+                }
+                if (func.object.get("arguments")) |args| {
+                    if (args == .string) try toolArguments(w, state, args.string);
+                }
+            };
         }
         return;
     }
-
-    // Google (Gemini)
     if (obj.object.get("candidates")) |candidates| {
-        if (candidates == .array and candidates.array.items.len > 0) {
-            const cand = candidates.array.items[0];
-            if (cand == .object) {
-                if (cand.object.get("content")) |content| {
-                    if (content == .object) {
-                        if (content.object.get("parts")) |parts| {
-                            if (parts == .array and parts.array.items.len > 0) {
-                                const part = parts.array.items[0];
-                                if (part == .object) {
-                                    if (part.object.get("text")) |t| {
-                                        if (t == .string and t.string.len > 0) {
-                                            try emitTextDelta(client_stream, t.string, block_index, allocator);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if (candidates != .array or candidates.array.items.len == 0) return;
+        const cand = candidates.array.items[0];
+        if (cand != .object) return;
+        const content = cand.object.get("content") orelse return;
+        if (content != .object) return;
+        const parts = content.object.get("parts") orelse return;
+        if (parts != .array) return;
+        for (parts.array.items) |part| {
+            if (part != .object) continue;
+            if (part.object.get("text")) |v| { if (v == .string) try text(w, state, v.string); }
         }
-        return;
     }
 }
 
-fn emitTextDelta(client_stream: std.net.Stream, text: []const u8, block_index: *usize, allocator: std.mem.Allocator) !void {
-    if (block_index.* == 0) {
-        try socket.send(client_stream, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
-        block_index.* = 1;
+test "terminal event detection ignores text containing terminal names" {
+    const a = std.testing.allocator;
+    try std.testing.expect(isTerminalEvent("{\"event\":{\"type\":\"response.completed\"}}", a));
+    try std.testing.expect(isTerminalEvent("{\"type\":\"message_stop\"}", a));
+    try std.testing.expect(!isTerminalEvent("{\"type\":\"content_block_delta\",\"text\":\"response.completed\"}", a));
+    try std.testing.expect(!isTerminalEvent("not json", a));
+}
+
+test "OpenAI stream emits role, escaped text, tool chunks, terminal chunk and DONE" {
+    const a = std.testing.allocator;
+    var out: std.io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var state = StreamState{ .anthropic = false, .model = "claude-test" };
+    try convertLine(&out.writer, &state, "{\"event\":{\"type\":\"message_start\"}}", a);
+    try convertLine(&out.writer, &state, "{\"event\":{\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\"}}}", a);
+    try convertLine(&out.writer, &state, "{\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi \\\"there\\\"\"}}}", a);
+    try convertLine(&out.writer, &state, "{\"event\":{\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"search\"}}}", a);
+    try convertLine(&out.writer, &state, "{\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":1}\"}}}", a);
+    try finish(&out.writer, &state);
+    const result = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"content\":\"hi \\\"there\\\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"id\":\"tool_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"arguments\":\"{\\\"q\\\":1}\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"finish_reason\":\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, result, "data: [DONE]\n\n"));
+    var lines = std.mem.splitSequence(u8, result, "\n\n");
+    while (lines.next()) |event| {
+        if (!std.mem.startsWith(u8, event, "data: {") ) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, event[6..], .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("chat.completion.chunk", parsed.value.object.get("object").?.string);
     }
-    var buf: std.io.Writer.Allocating = .init(allocator);
-    defer buf.deinit();
-    const w = &buf.writer;
-    try w.writeAll("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":");
-    try std.json.Stringify.encodeJsonString(text, .{}, w);
-    try w.writeAll("}}\n\n");
-    try socket.send(client_stream, buf.written());
+}
+
+test "Anthropic stream retains block framing" {
+    const a = std.testing.allocator;
+    var out: std.io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var state = StreamState{ .anthropic = true, .model = "claude-test" };
+    try convertLine(&out.writer, &state, "{\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"run\"}}", a);
+    try convertLine(&out.writer, &state, "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}", a);
+    try convertLine(&out.writer, &state, "{\"type\":\"content_block_stop\"}", a);
+    try finish(&out.writer, &state);
+    var events = std.mem.splitSequence(u8, out.written(), "\n\n");
+    while (events.next()) |event| {
+        const data_start = std.mem.indexOf(u8, event, "data: ") orelse continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, event[data_start + 6 ..], .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "event: content_block_stop\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"stop_reason\":\"tool_use\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.written(), "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
 }

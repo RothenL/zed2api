@@ -90,14 +90,56 @@ fn writeMessage(w: *std.io.Writer, msg: std.json.Value) !void {
     try w.writeAll("}");
 }
 
-/// Write Anthropic-native message (passthrough content as-is, including tool_use/tool_result)
+/// Preserve native content blocks, but normalize string content for Zed's
+/// Anthropic request parser, which requires a sequence of blocks.
 fn writeAnthropicMessage(w: *std.io.Writer, msg: std.json.Value) !void {
     if (msg != .object) return;
-    // Passthrough the entire message object as-is for Anthropic native format
-    try std.json.Stringify.value(msg, .{}, w);
+    try w.writeByte('{');
+    var it = msg.object.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try std.json.Stringify.encodeJsonString(entry.key_ptr.*, .{}, w);
+        try w.writeByte(':');
+        if (std.mem.eql(u8, entry.key_ptr.*, "content") and entry.value_ptr.* == .string) {
+            try w.writeAll("[{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(entry.value_ptr.*, .{}, w);
+            try w.writeAll("}]");
+        } else {
+            try std.json.Stringify.value(entry.value_ptr.*, .{}, w);
+        }
+    }
+    try w.writeByte('}');
 }
 
-/// Write message with OpenAI->Anthropic tool support conversion
+test "Anthropic string message content becomes text blocks" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"role\":\"user\",\"content\":\"hi\"}", .{});
+    defer parsed.deinit();
+    var out: std.io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try writeAnthropicMessage(&out.writer, parsed.value);
+    const converted = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
+    defer converted.deinit();
+    const blocks = converted.value.object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings("hi", blocks[0].object.get("text").?.string);
+}
+
+test "Anthropic native content blocks remain intact" {
+    const a = std.testing.allocator;
+    const input = "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"ok\"}]}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{});
+    defer parsed.deinit();
+    var out: std.io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try writeAnthropicMessage(&out.writer, parsed.value);
+    const converted = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
+    defer converted.deinit();
+    try std.testing.expectEqualStrings("tool_result", converted.value.object.get("content").?.array.items[0].object.get("type").?.string);
+}
+
 fn writeMessageWithToolSupport(w: *std.io.Writer, msg: std.json.Value, allocator: std.mem.Allocator) !void {
     if (msg != .object) return;
     const role = switch (msg.object.get("role") orelse return) {
