@@ -347,32 +347,32 @@ fn convertZedModelsToOpenAI(allocator: std.mem.Allocator, raw: []const u8) ![]co
 fn handleUploadAccounts(body: []const u8) !Response {
     if (body.len == 0) return .{ .status = 400, .body = "{\"error\":\"empty body\"}" };
 
-    // The UI sends either a wrapper { "accounts_json": "<raw json string>" } or the
-    // raw accounts.json content directly. Both must contain an "accounts" object.
-    // multipart/form-data is intentionally unsupported to keep parsing dependency-free.
+    // Parse the request body once and keep it alive for the whole function, so any
+    // borrowed slice (e.g. a wrapped `accounts_json` string) stays valid through the
+    // parse below. Parsing inside a nested block with a `defer deinit()` would free
+    // the backing memory before we use it — a use-after-free.
+    const body_parsed = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch
+        return .{ .status = 400, .body = "{\"error\":\"invalid json\"}" };
+    defer body_parsed.deinit();
+    if (body_parsed.value != .object)
+        return .{ .status = 400, .body = "{\"error\":\"invalid accounts.json\"}" };
+
+    // Resolve which bytes hold the accounts document:
+    //   - a wrapper { "accounts_json": "<raw json string>" }, or
+    //   - the body itself, which must carry an "accounts" object.
+    // `raw` borrows from either `body_parsed` (wrapper string) or `body`; both are
+    // alive for the whole function.
     var raw_accounts_json: []const u8 = "";
-    {
-        const wrapper = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch null;
-        if (wrapper) |w| {
-            defer w.deinit();
-            if (w.value == .object) {
-                if (w.value.object.get("accounts_json")) |v| {
-                    if (v == .string and v.string.len > 0) raw_accounts_json = v.string;
-                }
-            }
-        }
+    if (body_parsed.value.object.get("accounts_json")) |v| {
+        if (v == .string and v.string.len > 0) raw_accounts_json = v.string;
     }
     if (raw_accounts_json.len == 0) {
-        // Fall back to treating the body itself as the accounts document.
-        const probe = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch
-            return .{ .status = 400, .body = "{\"error\":\"invalid accounts.json\"}" };
-        defer probe.deinit();
-        if (probe.value != .object or probe.value.object.get("accounts") == null)
+        if (body_parsed.value.object.get("accounts") == null)
             return .{ .status = 400, .body = "{\"error\":\"missing 'accounts' field\"}" };
         raw_accounts_json = body;
     }
 
-    // Parse once; validate shape; collect names.
+    // Parse the resolved accounts document; validate shape.
     const parsed = std.json.parseFromSlice(std.json.Value, global_allocator, raw_accounts_json, .{}) catch
         return .{ .status = 400, .body = "{\"error\":\"parse error\"}" };
     defer parsed.deinit();

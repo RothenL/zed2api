@@ -1,7 +1,7 @@
 .{
     .name = .zed2api_auth,
     .version = "0.1.0",
-    .fingerprint = 0xa1c84e9f01b27d3a,
+    .fingerprint = 0xf0ebc01d7e12062d,
     .minimum_zig_version = "0.14.0",
     .paths = .{
         "build.zig",
