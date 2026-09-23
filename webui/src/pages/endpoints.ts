@@ -1,4 +1,6 @@
 const ENDPOINTS = [
+  { method: 'GET', path: '/healthz', desc: 'Liveness probe (always open, no auth)' },
+  { method: 'POST', path: '/zed/auth/login', desc: 'Exchange a token for an auth cookie' },
   { method: 'POST', path: '/v1/chat/completions', desc: 'OpenAI-compatible chat completions' },
   { method: 'POST', path: '/v1/messages', desc: 'Anthropic native messages API' },
   { method: 'GET', path: '/v1/models', desc: 'List available models' },

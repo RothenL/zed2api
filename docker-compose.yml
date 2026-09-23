@@ -12,6 +12,12 @@ services:
       # host-side port mapping above.
       HOST: "0.0.0.0"
       PORT: "8000"
+      # Shared access token. Leave empty to run without auth (local/dev only!).
+      # In production ALWAYS set this, e.g.:
+      #   ZED2API_TOKEN=$(openssl rand -hex 24) docker compose up -d --build
+      # Clients then send it as `Authorization: Bearer <token>` or `x-api-key: <token>`;
+      # browsers instead sign in once at the Web UI and get an auth cookie.
+      AUTH_TOKEN: "${ZED2API_TOKEN:-}"
       # Optional upstream proxy (Clash / v2ray / etc.) reachable from the container.
       # If your proxy runs on the Docker host, use host.docker.internal (Docker
       # Desktop) or the host's LAN IP (Linux). Left commented out by default.
@@ -21,7 +27,7 @@ services:
       # Drop accounts.json in ./data/, or upload it through the Web UI.
       - ./data:/data
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/v1/models"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3

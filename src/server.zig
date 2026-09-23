@@ -15,13 +15,44 @@ var cached_models_openai: ?[]const u8 = null;
 var cached_models_time: i64 = 0;
 const MODELS_CACHE_TTL: i64 = 3600; // 1 hour
 
+// Shared bearer token gating every API + management route. null = auth disabled
+// (backwards-compatible with the original open server). Set via the AUTH_TOKEN
+// env var.
+var auth_token: ?[]const u8 = null;
+
+/// Constant-time equality so token checks don't leak via a timing side channel.
+fn tokensMatch(provided: []const u8) bool {
+    const expected = auth_token orelse return true; // auth disabled
+    if (provided.len != expected.len) {
+        // Still walk the shorter buffer to keep the cost roughly independent of
+        // where the first difference sits.
+        var acc: u8 = 0;
+        const n = @min(provided.len, expected.len);
+        for (0..n) |i| acc |= provided[i] ^ expected[i];
+        acc |= @intFromBool(provided.len != expected.len);
+        return acc == 0;
+    }
+    var acc: u8 = 0;
+    for (expected, 0..) |c, i| acc |= c ^ provided[i];
+    return acc == 0;
+}
+
 pub fn run(allocator: std.mem.Allocator, port: u16) !void {
     global_allocator = allocator;
     account_mgr = accounts.AccountManager.init(allocator);
     defer account_mgr.deinit();
     account_mgr.loadFromFile() catch {};
 
+    // Load the shared auth token (if any). Owned by global_allocator so it lives
+    // for the whole process; auth checks borrow from it.
+    if (std.process.getEnvVarOwned(allocator, "AUTH_TOKEN") catch null) |t| {
+        // Treat an empty token as "disabled" so docker-compose's default-empty
+        // value doesn't accidentally lock the server.
+        if (t.len > 0) auth_token = t else allocator.free(t);
+    }
+
     std.debug.print("[zed2api] http://127.0.0.1:{d}\n[zed2api] {d} account(s) loaded\n", .{ port, account_mgr.list.items.len });
+    if (auth_token != null) std.debug.print("[zed2api] auth: ENABLED (AUTH_TOKEN set)\n", .{}) else std.debug.print("[zed2api] auth: disabled (set AUTH_TOKEN to enable)\n", .{});
 
     proxy.init(allocator);
     if (proxy.getHost()) |host| {
@@ -78,16 +109,68 @@ fn handleConnection(conn_stream: std.net.Stream) void {
     var parts = std.mem.splitScalar(u8, first_line, ' ');
     const method = parts.next() orelse return;
     const full_path = parts.next() orelse return;
-    const path = if (std.mem.indexOf(u8, full_path, "?")) |i| full_path[0..i] else full_path;
+    const query_start = std.mem.indexOf(u8, full_path, "?");
+    const path = if (query_start) |i| full_path[0..i] else full_path;
+    const query = if (query_start) |i| full_path[i + 1 ..] else "";
 
     var content_length: usize = 0;
+    // Auth extraction. These borrow from `headers` (which lives in hdr_buf for
+    // the whole handler), so they stay valid through routing.
+    var auth_bearer: ?[]const u8 = null;
+    var auth_apikey: ?[]const u8 = null;
+    var auth_cookie: ?[]const u8 = null;
     var header_lines = std.mem.splitSequence(u8, headers, "\r\n");
     while (header_lines.next()) |line| {
         if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
             const val = std.mem.trim(u8, line["content-length:".len..], " ");
             content_length = std.fmt.parseInt(usize, val, 10) catch 0;
+            continue;
+        }
+        if (std.ascii.startsWithIgnoreCase(line, "authorization:")) {
+            var val = std.mem.trim(u8, line["authorization:".len..], " \t");
+            // Strip an optional "Bearer " prefix so raw tokens also work here.
+            const prefix = "Bearer ";
+            if (val.len >= prefix.len and std.ascii.eqlIgnoreCase(val[0..prefix.len], prefix))
+                val = val[prefix.len..];
+            auth_bearer = val;
+            continue;
+        }
+        if (std.ascii.startsWithIgnoreCase(line, "x-api-key:")) {
+            auth_apikey = std.mem.trim(u8, line["x-api-key:".len..], " \t");
+            continue;
+        }
+        if (std.ascii.startsWithIgnoreCase(line, "cookie:")) {
+            auth_cookie = std.mem.trim(u8, line["cookie:".len..], " \t");
+            continue;
         }
     }
+
+    // Resolve the presented credential from any supported source.
+    var auth: Auth = .{};
+    if (auth_token != null) {
+        // Prefer header credentials; fall back to the `auth` cookie for browsers.
+        if (auth_bearer) |b| {
+            if (tokensMatch(b)) auth.token_ok = true;
+        } else if (auth_apikey) |k| {
+            if (tokensMatch(k)) auth.token_ok = true;
+        } else if (auth_cookie) |c| {
+            if (extractCookie(c, "auth")) |v| {
+                if (tokensMatch(v)) auth.token_ok = true;
+            }
+        }
+        // `?token=` on the query string lets a browser bookmark a login URL.
+        if (!auth.token_ok) {
+            if (extractQuery(query, "token")) |t| {
+                if (tokensMatch(t)) {
+                    auth.token_ok = true;
+                    auth.set_cookie = true; // bake a cookie so subsequent loads work
+                }
+            }
+        }
+    } else {
+        auth.token_ok = true; // auth disabled — allow everything
+    }
+
 
     // Read body (up to 16MB)
     const max_body = 16 * 1024 * 1024;
@@ -120,6 +203,18 @@ fn handleConnection(conn_stream: std.net.Stream) void {
         (std.mem.indexOf(u8, body, "\"stream\":true") != null or
         std.mem.indexOf(u8, body, "\"stream\": true") != null);
 
+    // Auth gate: when AUTH_TOKEN is set, refuse everything but the exempt paths.
+    if (auth_token != null and !auth.token_ok and !isExemptPath(method, path)) {
+        std.debug.print("[auth] denied {s} {s}\n", .{ method, path });
+        // Browsers hitting the UI get a login page; API clients get JSON 401.
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
+            socket.writeResponseWithType(conn_stream, 200, loginPageHtml(), "text/html; charset=utf-8");
+        } else {
+            socket.writeResponse(conn_stream, 401, "{\"error\":\"unauthorized\"}");
+        }
+        return;
+    }
+
     if (wants_stream) {
         const req_model = providers.extractModelFromBody(global_allocator, body) catch "unknown";
         const has_thinking = std.mem.indexOf(u8, body, "\"thinking\"") != null;
@@ -129,13 +224,13 @@ fn handleConnection(conn_stream: std.net.Stream) void {
     }
 
     // Non-streaming route
-    const response = route(method, path, body) catch |err| {
+    const response = route(method, path, body, auth) catch |err| {
         std.debug.print("[zed2api] route error: {} for {s} {s}\n", .{ err, method, path });
         socket.writeResponse(conn_stream, 500, "{\"error\":\"internal error\"}");
         return;
     };
     defer if (response.allocated) global_allocator.free(response.body);
-    socket.writeResponseWithType(conn_stream, response.status, response.body, response.content_type);
+    socket.writeResponseFull(conn_stream, response.status, response.extra_headers, response.body, response.content_type);
 }
 
 const Response = struct {
@@ -143,12 +238,60 @@ const Response = struct {
     body: []const u8,
     content_type: []const u8 = "application/json",
     allocated: bool = false,
+    // Optional extra response headers (e.g. Set-Cookie). Each entry is a full
+    // "Name: value" line; socket.writeResponseFull inserts them before the
+    // blank line.
+    extra_headers: []const []const u8 = &.{},
 };
 
-fn route(method: []const u8, path: []const u8, body: []const u8) !Response {
+const Auth = struct {
+    token_ok: bool = false,
+    // True when the credential came via `?token=` — we then bake an `auth`
+    // cookie into the response so the browser stays logged in on reload.
+    set_cookie: bool = false,
+};
+
+/// Paths that never require a token: the login endpoint itself, the container
+/// liveness probe, CORS preflight, and the harmless telemetry stubs.
+fn isExemptPath(method: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, method, "OPTIONS")) return true;
+    if (std.mem.eql(u8, path, "/healthz")) return true;
+    if (std.mem.eql(u8, path, "/zed/auth/login") and std.mem.eql(u8, method, "POST")) return true;
+    if (std.mem.eql(u8, path, "/api/event_logging/batch")) return true;
+    if (std.mem.startsWith(u8, path, "/v1/messages/count_tokens")) return true;
+    return false;
+}
+
+/// Pull a named cookie value out of a `Cookie:` header value. Borrowed slice.
+fn extractCookie(header_value: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, header_value, ';');
+    while (it.next()) |raw| {
+        const pair = std.mem.trim(u8, raw, " \t");
+        if (std.mem.startsWith(u8, pair, name) and pair.len > name.len and pair[name.len] == '=')
+            return pair[name.len + 1 ..];
+    }
+    return null;
+}
+
+/// Pull a named value out of a `k=v&k2=v2` query string. Borrowed slice.
+fn extractQuery(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+fn route(method: []const u8, path: []const u8, body: []const u8, auth: Auth) !Response {
     std.debug.print("[req] {s} {s} body={d}bytes\n", .{ method, path, body.len });
 
-    if (std.mem.eql(u8, path, "/")) return .{ .status = 200, .body = web_ui, .content_type = "text/html; charset=utf-8" };
+    if (std.mem.eql(u8, path, "/healthz"))
+        return .{ .status = 200, .body = "{\"status\":\"ok\"}" };
+    if (std.mem.eql(u8, path, "/zed/auth/login") and std.mem.eql(u8, method, "POST"))
+        return try handleAuthLogin(body);
+    if (std.mem.eql(u8, path, "/"))
+        return .{ .status = 200, .body = web_ui, .content_type = "text/html; charset=utf-8", .extra_headers = if (auth.set_cookie) loginSetCookieHeaders() else &.{} };
     if (std.mem.eql(u8, path, "/v1/models") and std.mem.eql(u8, method, "GET"))
         return try handleModels();
     if (std.mem.eql(u8, path, "/api/event_logging/batch"))
@@ -476,4 +619,106 @@ fn handleDeleteAccount(body: []const u8) Response {
     std.debug.print("[delete] account '{s}' removed\n", .{name});
     return .{ .status = 200, .body = "{\"success\":true}" };
 }
+
+// ── Auth: login page + login submit ──
+
+const login_cookie_name = "auth";
+
+/// Compose the Set-Cookie header value for an `auth` cookie carrying `token`.
+/// The token is treated as an opaque URL-safe string (it comes from AUTH_TOKEN).
+fn cookieHeaderLine(token: []const u8) []const u8 {
+    // Format into a process-wide scratch buffer. The slice we return borrows it
+    // only until the next call, which is fine: the response is written
+    // synchronously in handleConnection before any other request can reuse it.
+    login_cookie_buf.clearRetainingCapacity();
+    login_cookie_buf.writer(global_allocator).print("Set-Cookie: {s}={s}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000", .{ login_cookie_name, token }) catch {};
+    return login_cookie_buf.items;
+}
+
+// Single-entry scratch buffer for the cookie header line. The response is
+// written to the socket synchronously within the same connection handler, so a
+// process-wide buffer reused per request is sufficient and avoids per-request
+// allocation.
+var login_cookie_buf: std.ArrayListUnmanaged(u8) = .empty;
+
+// A module-level home for the one-element slice we hand to writeResponseFull.
+// Returning `&.{line}` from a function would point at a stack temporary that is
+// gone by the time the caller reads it — a dangling-pointer crash — so the
+// backing array lives here permanently and we just overwrite element [0].
+var login_cookie_headers: [1][]const u8 = .{""};
+
+fn loginSetCookieHeaders() []const []const u8 {
+    const tok = auth_token orelse return &.{};
+    const line = cookieHeaderLine(tok);
+    login_cookie_headers[0] = line;
+    return login_cookie_headers[0..1];
+}
+
+fn handleAuthLogin(body: []const u8) !Response {
+    const parsed = std.json.parseFromSlice(std.json.Value, global_allocator, body, .{}) catch
+        return .{ .status = 400, .body = "{\"error\":\"invalid json\"}" };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .status = 400, .body = "{\"error\":\"invalid body\"}" };
+    const token = switch (parsed.value.object.get("token") orelse return .{ .status = 400, .body = "{\"error\":\"missing token\"}" }) {
+        .string => |s| s,
+        else => return .{ .status = 400, .body = "{\"error\":\"bad type\"}" },
+    };
+
+    // Same constant-time check the gate uses.
+    if (auth_token == null or !tokensMatch(token))
+        return .{ .status = 401, .body = "{\"error\":\"unauthorized\"}" };
+
+    // Match: hand back the Set-Cookie line so the browser stores it. The token
+    // we embed is the server's own AUTH_TOKEN (constant-time verified above).
+    return .{ .status = 200, .body = "{\"success\":true}", .extra_headers = loginSetCookieHeaders() };
+}
+
+/// Minimal inline login page. POSTing the token to /zed/auth/login sets the
+/// `auth` cookie and redirects to `/`. Keeps no external assets.
+fn loginPageHtml() []const u8 {
+    return
+        \\<!doctype html><html lang="en"><head><meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<title>zed2api · Sign in</title>
+        \\<style>
+        \\  :root { color-scheme: light dark; }
+        \\  * { box-sizing: border-box; }
+        \\  body { margin:0; min-height:100vh; display:grid; place-items:center;
+        \\         font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        \\         background:#0d1117; color:#c9d1d9; }
+        \\  .card { width:min(420px, 92vw); background:#161b22; border:1px solid #30363d;
+        \\          border-radius:12px; padding:32px; box-shadow:0 8px 32px rgba(0,0,0,.4); }
+        \\  h1 { margin:0 0 4px; font-size:20px; display:flex; align-items:center; gap:8px; }
+        \\  .sub { margin:0 0 24px; color:#8b949e; font-size:13px; }
+        \\  label { display:block; font-size:13px; color:#8b949e; margin-bottom:6px; }
+        \\  input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid #30363d;
+        \\           background:#0d1117; color:#c9d1d9; font-size:14px; outline:none; }
+        \\  input:focus { border-color:#58a6ff; }
+        \\  button { margin-top:16px; width:100%; padding:11px; border:0; border-radius:8px;
+        \\            background:#238636; color:#fff; font-size:14px; font-weight:600; cursor:pointer; }
+        \\  button:hover { background:#2ea043; }
+        \\  button:disabled { opacity:.6; cursor:default; }
+        \\  .err { margin-top:14px; color:#f85149; font-size:13px; min-height:18px; }
+        \\  .hint { margin-top:18px; color:#6e7681; font-size:12px; line-height:1.5; }
+        \\</style></head><body>
+        \\<form class="card" id="f">
+        \\  <h1>⚡ zed2api</h1>
+        \\  <p class="sub">This server requires a shared access token.</p>
+        \\  <label for="t">Access token</label>
+        \\  <input id="t" name="token" type="password" autocomplete="off" autofocus placeholder="Paste your AUTH_TOKEN">
+        \\  <button type="submit">Sign in</button>
+        \\  <div class="err" id="e"></div>
+        \\  <p class="hint">The token is stored in an HttpOnly cookie for this browser.<br>API clients may instead send <code>Authorization: Bearer &lt;token&gt;</code> or <code>x-api-key: &lt;token&gt;</code>.</p>
+        \\</form>
+        \\<script>
+        \\const f=document.getElementById('f'),e=document.getElementById('e'),t=document.getElementById('t');
+        \\f.addEventListener('submit',async ev=>{ev.preventDefault();e.textContent='';const b=document.querySelector('button');b.disabled=true;
+        \\try{const r=await fetch('/zed/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t.value})});
+        \\if(r.ok){window.location.href='/';}else{e.textContent='Sign-in failed: '+(r.status===401?'wrong token':'HTTP '+r.status);b.disabled=false;}}
+        \\catch(err){e.textContent='Network error: '+err;b.disabled=false;}});
+        \\</script>
+        \\</body></html>
+    ;
+}
+
 

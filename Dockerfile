@@ -51,8 +51,9 @@ FROM debian:bookworm-slim AS runtime
 #   - ca-certificates : TLS verification for cloud.zed.dev
 #   - curl            : used by the proxy path (HTTPS_PROXY) and the healthcheck
 #   - tzdata          : correct timestamps in logs
+#   - gosu            : drop privileges after the entrypoint fixes /data ownership
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl tzdata \
+      ca-certificates curl tzdata gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user; the binary writes accounts.json and temp files to its working dir.
@@ -63,8 +64,13 @@ RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin zed2api
 RUN mkdir -p /app /data && chown -R zed2api:zed2api /app /data
 
 COPY --from=zig-builder /build/zig-out/bin/zed2api /app/zed2api
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER zed2api
+# NOTE: no `USER zed2api` here. The entrypoint starts as root so it can chown a
+# bind-mounted /data (which Docker may have created as root on the host) and then
+# uses gosu to drop to the unprivileged zed2api user before exec'ing the server.
+ENTRYPOINT ["docker-entrypoint.sh"]
 
 # The server reads accounts.json and writes temp files relative to its cwd, so run
 # it from /data. HOST=0.0.0.0 is required inside a container (traffic arrives on a
@@ -77,7 +83,9 @@ VOLUME /data
 
 EXPOSE 8000
 
+# Liveness probe hits /healthz: it always returns 200 and never needs an account
+# or an AUTH_TOKEN, so the probe works even when auth is enabled.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${PORT}/v1/models" >/dev/null || exit 1
+  CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null || exit 1
 
 CMD ["sh", "-c", "/app/zed2api serve ${PORT}"]

@@ -52,15 +52,18 @@ fn printUsage() void {
         \\
         \\Authentication is configured by uploading accounts.json (produced by the
         \\desktop auth tool) through the Web UI — there is no in-process OAuth flow.
+        \\Set the AUTH_TOKEN env var to gate all endpoints behind a shared token.
         \\
         \\Endpoints:
-        \\  POST /v1/chat/completions      OpenAI compatible
-        \\  POST /v1/messages              Anthropic native
-        \\  GET  /v1/models                List models
-        \\  GET  /zed/accounts             List accounts
-        \\  POST /zed/accounts/upload      Upload accounts.json content
-        \\  POST /zed/accounts/delete      Remove an account
-        \\  GET  /                         Web UI
+        \\  GET  /healthz                Liveness probe (always open)
+        \\  POST /zed/auth/login         Exchange a token for an auth cookie
+        \\  POST /v1/chat/completions    OpenAI compatible
+        \\  POST /v1/messages            Anthropic native
+        \\  GET  /v1/models              List models
+        \\  GET  /zed/accounts           List accounts
+        \\  POST /zed/accounts/upload    Upload accounts.json content
+        \\  POST /zed/accounts/delete    Remove an account
+        \\  GET  /                       Web UI
         \\
     , .{});
 }

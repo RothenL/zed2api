@@ -1,3 +1,5 @@
+import { authHeaders } from './auth'
+
 export interface Account {
   name: string
   user_id: string
@@ -26,7 +28,7 @@ export interface UsageInfo {
 }
 
 export async function fetchAccounts(): Promise<AccountsResponse> {
-  const r = await fetch('/zed/accounts')
+  const r = await fetch('/zed/accounts', { headers: authHeaders() })
   if (!r.ok) throw new Error(`${r.status}`)
   return r.json()
 }
@@ -34,7 +36,7 @@ export async function fetchAccounts(): Promise<AccountsResponse> {
 export async function switchAccount(name: string): Promise<void> {
   await fetch('/zed/accounts/switch', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ account: name }),
   })
 }
@@ -42,7 +44,7 @@ export async function switchAccount(name: string): Promise<void> {
 export async function deleteAccount(name: string): Promise<void> {
   const r = await fetch('/zed/accounts/delete', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ account: name }),
   })
   if (!r.ok) throw new Error(`${r.status}`)
@@ -81,7 +83,7 @@ export async function uploadAccounts(input: File | string): Promise<UploadResult
   }
   const r = await fetch('/zed/accounts/upload', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ accounts_json: accountsJson }),
   })
   const data = await r.json()
@@ -92,13 +94,13 @@ export async function uploadAccounts(input: File | string): Promise<UploadResult
 }
 
 export async function fetchUsage(): Promise<UsageInfo> {
-  const r = await fetch('/zed/usage')
+  const r = await fetch('/zed/usage', { headers: authHeaders() })
   if (!r.ok) throw new Error(`${r.status}`)
   return r.json()
 }
 
 export async function fetchBilling(): Promise<Record<string, unknown>> {
-  const r = await fetch('/zed/billing')
+  const r = await fetch('/zed/billing', { headers: authHeaders() })
   if (!r.ok) throw new Error(`${r.status}`)
   return r.json()
 }
@@ -115,7 +117,7 @@ export async function sendOpenAI(
 ): Promise<string> {
   const r = await fetch('/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
   })
   const d = await r.json()
@@ -129,7 +131,7 @@ export async function sendAnthropic(
 ): Promise<string> {
   const r = await fetch('/v1/messages', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
   })
   const d = await r.json()

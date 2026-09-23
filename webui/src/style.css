@@ -456,3 +456,73 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Login card (shown when AUTH_TOKEN gates the server) */
+.login-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  padding: 24px;
+}
+.login-card {
+  width: min(420px, 92vw);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 32px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.08);
+}
+.login-logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.login-logo span {
+  display: inline-flex;
+  color: var(--accent);
+}
+.login-sub {
+  color: var(--text-secondary);
+  font-size: 13px;
+  margin: 0 0 24px;
+}
+.login-label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.login-input {
+  width: 100%;
+  padding: 11px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+  box-sizing: border-box;
+}
+.login-input:focus { border-color: var(--accent); }
+.login-btn {
+  margin-top: 16px;
+  width: 100%;
+  padding: 11px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.login-btn:hover { filter: brightness(1.05); }
+.login-btn:disabled { opacity: 0.6; cursor: default; }
+.login-err { margin-top: 14px; color: #e5484d; font-size: 13px; min-height: 18px; }
+.login-hint { margin-top: 18px; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.login-hint code { background: var(--bg-code); padding: 1px 4px; border-radius: 4px; }

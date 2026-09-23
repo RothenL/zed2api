@@ -18,6 +18,7 @@
 - [Docker 部署](#docker-部署)
 - [Claude Code 集成](#claude-code-集成)
 - [代理设置](#代理设置)
+- [鉴权](#鉴权)
 - [安全说明](#安全说明)
 - [项目结构](#项目结构)
 
@@ -114,6 +115,7 @@ HOST=0.0.0.0 ./zed2api serve
 |----------|--------|------|
 | `PORT` | `8000` | 未传 `[端口]` 参数时的监听端口 |
 | `HOST` | `127.0.0.1` | 监听地址；Docker 内需设为 `0.0.0.0` |
+| `AUTH_TOKEN` | （空） | **共享访问 token**；设置后所有接口都需要鉴权，详见 [鉴权](#鉴权) |
 | `HTTPS_PROXY` | （空） | 上游请求（访问 `cloud.zed.dev`）走的 HTTP/HTTPS 代理 |
 
 打开 `http://127.0.0.1:8000` 进入 Web 管理界面，在 **Accounts** 页上传 `accounts.json`。
@@ -132,7 +134,9 @@ HOST=0.0.0.0 ./zed2api serve
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET`  | `/` | Web 管理界面 |
+| `GET`  | `/` | Web 管理界面（鉴权开启时需登录） |
+| `GET`  | `/healthz` | 存活探针（**永远公开**，无需鉴权） |
+| `POST` | `/zed/auth/login` | 用 token 换取 `auth` cookie |
 | `GET`  | `/zed/accounts` | 列出账号 |
 | `POST` | `/zed/accounts/upload` | 上传 `accounts.json`（覆盖现有账号） |
 | `POST` | `/zed/accounts/switch` | 切换当前账号 |
@@ -214,8 +218,8 @@ zig build
 # 构建并启动（默认监听宿主机 8000）
 docker compose up -d --build
 
-# 自定义宿主机端口
-ZED2API_PORT=9000 docker compose up -d --build
+# 自定义宿主机端口 + 开启鉴权（生产环境强烈建议）
+ZED2API_PORT=9000 ZED2API_TOKEN="$(openssl rand -hex 24)" docker compose up -d --build
 
 # 查看日志 / 健康状态
 docker compose logs -f
@@ -224,7 +228,8 @@ docker compose ps
 
 - 容器内服务绑定 `0.0.0.0:8000`，由 Docker 端口映射控制对外暴露。
 - 运行时数据（`accounts.json` 等）持久化在 `./data` 卷，首次启动后通过 Web UI 上传账号文件。
-- 镜像以非 root 用户 `zed2api`（uid 10001）运行，内置 `/v1/models` 健康检查。
+- 容器以非 root 用户 `zed2api`（uid 10001）运行：entrypoint 先以 root 修正 `/data` 属主，再用 `gosu` 降权 —— 所以即使宿主机以 root 建了 `./data`，上传也不会再报 `cannot write accounts.json`。
+- 健康检查打 `/healthz`（永远公开），与鉴权和账号解耦：开启 `AUTH_TOKEN` 后容器仍能正常判为 healthy。
 
 ### 构建阶段说明（`Dockerfile`）
 
@@ -232,7 +237,7 @@ docker compose ps
 |------|----------|------|
 | `webui` | `node:22-bookworm-slim` | `npm ci && npm run build` 生成 `webui/dist/index.html` |
 | `zig-builder` | `debian:bookworm-slim` | 下载 Zig 0.15.x，`zig build -Dwebui=false -Dtarget=x86_64-linux` |
-| `runtime` | `debian:bookworm-slim` | 仅装 `ca-certificates curl tzdata`，放入二进制，非 root 运行 |
+| `runtime` | `debian:bookworm-slim` | 装 `ca-certificates curl tzdata gosu`，放入二进制 + entrypoint，非 root 运行 |
 
 ### 上游代理
 
@@ -261,20 +266,68 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 ./zed2api serve
 ```
 
+## 鉴权
+
+默认情况下服务**无鉴权**（向后兼容本地/内网用途）。设置环境变量 `AUTH_TOKEN` 即可给所有接口加一道共享 token 门槛 —— 一个 token 同时保护 API 和 Web UI，配置最简单，适合个人部署。
+
+### 启用
+
+```bash
+# 本地二进制
+AUTH_TOKEN="$(openssl rand -hex 24)" ./zed2api serve
+
+# Docker：用 compose 的 ZED2API_TOKEN 透传到容器的 AUTH_TOKEN
+ZED2API_TOKEN="$(openssl rand -hex 24)" docker compose up -d --build
+```
+
+### API 客户端如何带 token
+
+任选一种（两种完全等价）：
+
+```bash
+# Authorization: Bearer
+curl -H "Authorization: Bearer <token>" http://你的服务器/v1/chat/completions ...
+
+# 或 x-api-key
+curl -H "x-api-key: <token>" http://你的服务器/v1/chat/completions ...
+```
+
+Claude Code：
+
+```bash
+export ANTHROPIC_BASE_URL=http://你的服务器
+export ANTHROPIC_AUTH_TOKEN=<你的 AUTH_TOKEN>   # SDK 会以 Bearer 形式发送
+claude
+```
+
+### 浏览器如何登录
+
+打开 Web UI 会看到登录页，粘贴 token 提交即可 —— 服务器种一个 `HttpOnly; SameSite=Strict` 的 `auth` cookie（30 天），之后该浏览器自动带凭证。也可以直接访问 `http://你的服务器/?token=<token>` 用 URL 登录。
+
+### 豁免路径（无需 token）
+
+只有以下路径永远不需要 token：
+
+- `GET /healthz` —— 容器健康检查探针
+- `POST /zed/auth/login` —— 登录提交本身
+- `OPTIONS *`、`/api/event_logging/batch`、`/v1/messages/count_tokens` —— 无副作用的桩响应
+
+其它一切（`/v1/*`、`/zed/*`、`GET /`）开启 `AUTH_TOKEN` 后都需要凭证。
+
 ## 安全说明
 
-⚠️ **上传接口默认无鉴权**：任何能访问服务端口的人都能通过 `/zed/accounts/upload`
-替换服务器的 `accounts.json`。生产部署请务必：
+⚠️ **不设置 `AUTH_TOKEN` 时上传接口无鉴权**：任何能访问服务端口的人都能通过 `/zed/accounts/upload` 替换服务器的 `accounts.json`、或白嫖你的 API。生产部署请务必：
 
-- 不要把服务端口直接暴露到公网；用反向代理或只在可信网络内访问。
-- 或在反向代理层（Nginx / Caddy 等）对 `/zed/*` 路径加 Basic Auth / IP 白名单。
+- **设置 `AUTH_TOKEN`**（见上「鉴权」）。
+- 不要把服务端口直接暴露到公网；推荐在前面加 Nginx / Caddy 反向代理并上 HTTPS（token 明文走 HTTP 会被中间人截获）。
+- 若要更细粒度控制，可在反代层对 `/zed/*` 再叠加 IP 白名单。
 
 ## 项目结构
 
 ```
 src/
   main.zig       - 入口，CLI 命令（serve / import / accounts）
-  server.zig     - HTTP 服务器，路由，账号接口（含上传/删除）
+  server.zig     - HTTP 服务器，路由，账号接口（含上传/删除），共享 token 鉴权
   stream.zig     - SSE 流式代理
   socket.zig     - 跨平台 Socket I/O（Windows ws2_32 / POSIX）
   zed.zig        - Token 管理，计费查询，代理编排
@@ -284,8 +337,10 @@ src/
   auth.zig       - RSA 密钥对，OAuth 登录，浏览器启动（仅授权工具使用）
   models.json    - 内嵌模型列表
 webui/           - Vite + TypeScript Web UI（编译为单 HTML 文件嵌入二进制）
+webui/src/auth.ts - 客户端鉴权辅助（token 存储 + 登录）
 tools/auth-tool/ - 独立的 Windows 授权工具，生成 accounts.json
 Dockerfile       - 多阶段构建（Node 构建 WebUI → Zig 编译 → 精简运行时）
+docker-entrypoint.sh - 容器入口：root 修 /data 属主后 gosu 降权
 docker-compose.yml - 一键部署，带健康检查与数据卷
 accounts.example.json - accounts.json 示例格式
 ```
