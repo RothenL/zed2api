@@ -1,0 +1,39 @@
+# ── Docker build context exclusions ──────────────────────────────────────────
+# Keep the build context lean and prevent local secrets / build artifacts from
+# leaking into the image. Mirrors .gitignore where it matters for builds.
+
+# VCS / metadata — not needed to build the image.
+.git/
+.gitignore
+.github/
+
+# Zig build artifacts (host). The image builds its own in the zig-builder stage.
+.zig-cache/
+**/.zig-cache/
+zig-out/
+zig-out-*/
+tools/auth-tool/zig-out/
+
+# WebUI: node_modules must NOT shadow the container's `npm ci`. dist/ is rebuilt
+# inside the webui stage and then COPYed via --from=webui, so the host copy is
+# never used by the image.
+webui/node_modules/
+**/node_modules/
+webui/dist/
+
+# Compiled binaries / debug symbols.
+*.exe
+*.pdb
+debug_*.png
+_debug/
+
+# Runtime data & secrets — accounts.json is produced by the desktop auth tool
+# and uploaded via the Web UI at runtime; it must never get baked into the image.
+accounts.json
+github_accounts.json
+zed2api_*.json
+data/
+
+# Misc local artifacts.
+*.tar.gz
+*.log
